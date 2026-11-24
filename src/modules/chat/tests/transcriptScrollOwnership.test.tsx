@@ -63,14 +63,17 @@ function createContainer(scrollHeight: number, clientHeight: number) {
   return { element: element as HTMLDivElement, writes, scrollHeight };
 }
 
-function createStore(messagesBySession: Map<string, NormalizedMessage[]>) {
+function createStore(
+  messagesBySession: Map<string, NormalizedMessage[]>,
+  options: { hasMore?: () => boolean } = {},
+) {
   // A hydrated slot, so the session-loading effect takes its early return
   // instead of re-fetching on every render.
   const slotFor = (sessionId: string) => ({
     fetchedAt: 1,
     status: 'idle' as const,
     total: messagesBySession.get(sessionId)?.length ?? 0,
-    hasMore: false,
+    hasMore: options.hasMore?.() ?? false,
     offset: messagesBySession.get(sessionId)?.length ?? 0,
   });
 
@@ -255,5 +258,202 @@ describe('search jump ownership', () => {
       0,
       'and must not flash the search highlight on one of its rows',
     );
+  });
+});
+
+describe('scrolling back through older history', () => {
+  const PAGE = 20;
+  const ROW_HEIGHT = 50;
+
+  /**
+   * A container with just enough geometry for the scroll-anchor code: one
+   * fixed transcript row whose on-screen top is its offset within the
+   * content minus scrollTop. Rows added or resized above it move that offset.
+   */
+  function createHistoryContainer(initialRows: number, clientHeight: number) {
+    const element = document.createElement('div');
+    const writes: number[] = [];
+    let rows = initialRows;
+    let scrollTop = 0;
+    let extraHeight = 0;
+    // The row the user is looking at, a little below the top of the content.
+    let anchorDocTop = 50;
+
+    Object.defineProperty(element, 'scrollHeight', { get: () => rows * ROW_HEIGHT + extraHeight });
+    Object.defineProperty(element, 'clientHeight', { get: () => clientHeight });
+    Object.defineProperty(element, 'scrollTop', {
+      get: () => scrollTop,
+      set: (next: number) => {
+        scrollTop = next;
+        writes.push(next);
+      },
+    });
+    element.scrollBy = ((options: ScrollToOptions) => {
+      scrollTop += options.top ?? 0;
+      writes.push(scrollTop);
+    }) as typeof element.scrollBy;
+    element.getBoundingClientRect = () => ({ top: 0, bottom: clientHeight } as DOMRect);
+
+    const content = document.createElement('div');
+    const anchor = document.createElement('div');
+    // A LazyMessageRow wrapper: a direct child of the pane's content column.
+    anchor.setAttribute('data-message-timestamp', '2026-01-02T00:00:00.000Z');
+    anchor.getBoundingClientRect = () => {
+      const top = anchorDocTop - scrollTop;
+      return { top, bottom: top + ROW_HEIGHT } as DOMRect;
+    };
+    content.appendChild(anchor);
+    element.appendChild(content);
+    // Attached like the real pane, so rows report `isConnected`.
+    document.body.appendChild(element);
+
+    return {
+      element: element as HTMLDivElement,
+      writes,
+      /** A user scroll: moves the viewport without going through `writes`. */
+      userScrollTo(next: number) {
+        scrollTop = next;
+      },
+      /** What the DOM looks like once a page of older rows has rendered above. */
+      prependRows(count: number) {
+        rows += count;
+        anchorDocTop += count * ROW_HEIGHT;
+      },
+      /** A row above the viewport changing height after it rendered. */
+      growAbove(px: number) {
+        extraHeight += px;
+        anchorDocTop += px;
+      },
+      get scrollTop() {
+        return scrollTop;
+      },
+    };
+  }
+
+  async function setup(initialRows: number) {
+    let hasMore = true;
+    const messages = new Map<string, NormalizedMessage[]>([
+      [SESSION_A, Array.from({ length: initialRows }, (_, i) => (
+        buildMessage(1000 + i, `2026-01-02T00:00:${String(i % 60).padStart(2, '0')}.000Z`)
+      ))],
+    ]);
+    const store = createStore(messages, { hasMore: () => hasMore });
+    let resolveFetch: (() => void) | null = null;
+    store.fetchMore.mockImplementation((sessionId: string) => new Promise((resolve) => {
+      resolveFetch = () => {
+        const older = Array.from({ length: PAGE }, (_, i) => (
+          buildMessage(i, `2026-01-01T00:00:${String(i).padStart(2, '0')}.000Z`)
+        ));
+        messages.set(sessionId, [...older, ...messages.get(sessionId)!]);
+        hasMore = false;
+        resolve({ slot: store.getSessionSlot(sessionId), prependedCount: PAGE } as never);
+      };
+    }) as never);
+
+    const hook = await renderChatSessionState({ session: { id: SESSION_A } as ProjectSession, store });
+    const container = createHistoryContainer(initialRows, 500);
+    (hook.result.current.scrollContainerRef as { current: HTMLDivElement | null }).current = container.element;
+    // Let the hydrated-slot effect publish `hasMore`.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    assert.equal(hook.result.current.hasMoreMessages, true, 'fixture should start with older history');
+
+    return { ...hook, store, container, resolve: () => resolveFetch?.() };
+  }
+
+  it('starts fetching older rows before the user hits the top', async () => {
+    const { result, store, container } = await setup(100);
+
+    // Well clear of the old 100px trigger, but under one viewport from the top.
+    container.userScrollTo(400);
+    act(() => {
+      // Not awaited: the request is left in flight, only its start matters.
+      void result.current.handleScroll();
+    });
+
+    expect(store.fetchMore).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the rows the user is looking at in place, even if they kept scrolling during the fetch', async () => {
+    const { result, rerender, container, resolve } = await setup(100);
+
+    container.userScrollTo(60);
+    let pending!: Promise<unknown>;
+    act(() => {
+      pending = result.current.handleScroll();
+    });
+
+    // Momentum carries the user further up while the request is in flight.
+    container.userScrollTo(10);
+
+    await act(async () => {
+      resolve();
+      await pending;
+      container.prependRows(PAGE);
+      rerender({ session: { id: SESSION_A } as ProjectSession });
+    });
+
+    // Where the user *is* (10), shifted down by exactly the prepended height —
+    // not where they were when the fetch started (60).
+    assert.equal(container.scrollTop, 10 + PAGE * ROW_HEIGHT);
+  });
+
+  it('holds the view still when a row above it resizes as the user scrolls', async () => {
+    const { result, container } = await setup(100);
+
+    container.userScrollTo(3000);
+    await act(async () => {
+      await result.current.handleScroll();
+    });
+    container.writes.length = 0;
+
+    // The user scrolls up 10px, and in the same frame a row above the viewport
+    // that had never rendered is laid out 300px taller than its placeholder.
+    container.userScrollTo(2990);
+    container.growAbove(300);
+    await act(async () => {
+      await result.current.handleScroll();
+    });
+
+    assert.equal(container.scrollTop, 2990 + 300);
+  });
+
+  it('compensates for rows resizing above the view between scrolls', async () => {
+    const observers: Array<() => void> = [];
+    vi.stubGlobal('ResizeObserver', class {
+      constructor(private readonly callback: () => void) { observers.push(() => this.callback()); }
+      observe() {}
+      disconnect() {}
+    });
+    const { result, container } = await setup(100);
+
+    container.userScrollTo(3000);
+    await act(async () => {
+      await result.current.handleScroll();
+    });
+    container.growAbove(250);
+    act(() => {
+      for (const notify of observers) notify();
+    });
+
+    assert.equal(container.scrollTop, 3000 + 250);
+  });
+
+  it('never pushes back against plain user scrolling', async () => {
+    const { result, container } = await setup(100);
+
+    container.userScrollTo(3000);
+    await act(async () => {
+      await result.current.handleScroll();
+    });
+    container.writes.length = 0;
+    container.userScrollTo(2700);
+    await act(async () => {
+      await result.current.handleScroll();
+    });
+
+    assert.deepEqual(container.writes, []);
+    assert.equal(container.scrollTop, 2700);
   });
 });

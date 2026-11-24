@@ -588,20 +588,18 @@
     clip-path: inset(-8px -8px 0 -8px);
   }
 
+  /* Rows resize as their lazy placeholders swap in. The pane keeps the visible
+     row still itself (modules/chat/utils/scrollAnchor.ts), consistently across
+     browsers; native anchoring as well would correct every shift twice. */
+  .chat-messages-pane {
+    overflow-anchor: none;
+  }
+
+  /* No content-visibility: LazyMessageRow already unmounts rows far from the
+     viewport, and skipped rows here changed height with no render to hook,
+     sometimes flipping back a frame later, which the scroll anchor chased. */
   .chat-message {
     contain: layout style paint;
-    content-visibility: auto;
-    contain-intrinsic-size: auto 180px;
-  }
-
-  .chat-message.assistant {
-    contain-intrinsic-size: auto 240px;
-  }
-
-  .chat-message.user,
-  .chat-message.tool,
-  .chat-message.error {
-    contain-intrinsic-size: auto 96px;
   }
 
   /* Mobile touch optimization and safe areas */

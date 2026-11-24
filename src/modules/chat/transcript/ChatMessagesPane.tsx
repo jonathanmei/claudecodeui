@@ -1,5 +1,5 @@
 import { useTranslation } from 'react-i18next';
-import { memo, useCallback, useMemo } from 'react';
+import { memo, useCallback, useLayoutEffect, useMemo, useRef } from 'react';
 import type { Dispatch, RefObject, SetStateAction } from 'react';
 
 import type { BackgroundTaskSummary,
@@ -11,6 +11,9 @@ import type { BackgroundTaskSummary,
   ProviderModelsDefinition } from '@/shared/types';
 import { getIntrinsicMessageKey } from '@/modules/chat/utils/messageKeys';
 import { groupConsecutiveTools, isToolGroupItem } from '@/modules/chat/utils/toolGrouping';
+import { countPrependedRows } from '@/modules/chat/utils/prependedRows';
+import { scrollDebug } from '@/modules/chat/utils/scrollDebug';
+import { SESSION_MESSAGES_PAGE_SIZE } from '@/modules/chat/utils/sessionMessagePagination';
 import { useLazyRowObserver } from '@/modules/chat/hooks/useLazyRowObserver';
 import LazyMessageRow from '@/modules/chat/transcript/LazyMessageRow';
 import MessageComponent from '@/modules/chat/transcript/MessageComponent';
@@ -26,6 +29,8 @@ import { BackgroundTasksStrip } from '@/modules/chat/transcript/BackgroundTasksS
  * near the viewport. Covers a bit more than one screen of typical rows.
  */
 const INITIAL_MOUNTED_TAIL_ROWS = 30;
+/** The most rows one scroll-back page can add (with slack for how messages group). */
+const MAX_EAGER_PREPENDED_ROWS = SESSION_MESSAGES_PAGE_SIZE * 3;
 
 type ChatMessagesPaneProps = {
   scrollContainerRef: RefObject<HTMLDivElement>;
@@ -185,6 +190,20 @@ function ChatMessagesPane({
     [messageKeyMap],
   );
 
+  const rowKeys = useMemo(
+    () => groupedVisibleMessages.map((item) => (
+      isToolGroupItem(item) ? `tool-group-${getMessageKey(item.messages[0])}` : getMessageKey(item)
+    )),
+    [groupedVisibleMessages, getMessageKey],
+  );
+  // Rows a scroll-back page just added mount with content (see countPrependedRows).
+  const previousFirstRowKeyRef = useRef<string | null>(null);
+  const prependedRowCount = countPrependedRows(rowKeys, previousFirstRowKeyRef.current, MAX_EAGER_PREPENDED_ROWS);
+  useLayoutEffect(() => {
+    previousFirstRowKeyRef.current = rowKeys[0] ?? null;
+    if (prependedRowCount > 0) scrollDebug('eager-mount', { rows: prependedRowCount, total: rowKeys.length });
+  }, [rowKeys, prependedRowCount]);
+
   return (
     <div
       ref={scrollContainerRef}
@@ -246,24 +265,25 @@ function ChatMessagesPane({
         />
       ) : (
         <>
-          {/* Loading indicator for older messages (hide when load-all is active) */}
-          {isLoadingMoreMessages && !isLoadingAllMessages && !allMessagesLoaded && (
-            <div className="py-3 text-center text-gray-500 dark:text-gray-400">
-              <div className="flex items-center justify-center space-x-2">
-                <div className="h-4 w-4 animate-spin rounded-full border-b-2 border-gray-400" />
-                <p className="text-sm">{t('session.loading.olderMessages')}</p>
-              </div>
-            </div>
-          )}
-
-          {/* Indicator showing there are more messages to load (hide when all loaded) */}
-          {hasMoreMessages && !isLoadingMoreMessages && !allMessagesLoaded && (
-            <div className="border-b border-gray-200 py-2 text-center text-sm text-gray-500 dark:border-gray-700 dark:text-gray-400">
-              {totalMessages > 0 && (
-                <span>
-                  {t('session.messages.showingOf', { shown: sessionMessagesCount, total: totalMessages })}{' '}
-                  <span className="text-xs">{t('session.messages.scrollToLoad')}</span>
-                </span>
+          {/* One fixed-height slot for "more above" / "loading older": swapping
+              between rows of different heights shifted everything below it
+              while the user was scrolling. */}
+          {(hasMoreMessages || isLoadingMoreMessages) && !allMessagesLoaded && (
+            <div className="flex h-10 items-center justify-center border-b border-gray-200 text-center text-sm text-gray-500 dark:border-gray-700 dark:text-gray-400">
+              {isLoadingMoreMessages ? (
+                !isLoadingAllMessages && (
+                  <div className="flex items-center justify-center space-x-2">
+                    <div className="h-4 w-4 animate-spin rounded-full border-b-2 border-gray-400" />
+                    <p>{t('session.loading.olderMessages')}</p>
+                  </div>
+                )
+              ) : (
+                totalMessages > 0 && (
+                  <span>
+                    {t('session.messages.showingOf', { shown: sessionMessagesCount, total: totalMessages })}{' '}
+                    <span className="text-xs">{t('session.messages.scrollToLoad')}</span>
+                  </span>
+                )
               )}
             </div>
           )}
@@ -301,7 +321,8 @@ function ChatMessagesPane({
               // Rows near the tail mount their content on first commit so the
               // initial scroll-to-bottom measures real heights; older rows
               // start as placeholders and mount when scrolled toward.
-              const initiallyNearViewport = index >= rowCount - INITIAL_MOUNTED_TAIL_ROWS;
+              const initiallyNearViewport = index >= rowCount - INITIAL_MOUNTED_TAIL_ROWS
+                || index < prependedRowCount;
 
               if (isToolGroupItem(item)) {
                 const groupPrevMessage = prevMessage;
@@ -309,7 +330,7 @@ function ChatMessagesPane({
 
                 return (
                   <LazyMessageRow
-                    key={`tool-group-${getMessageKey(item.messages[0])}`}
+                    key={rowKeys[index]}
                     lazyRows={lazyRows}
                     timestamp={item.timestamp}
                     initiallyNearViewport={initiallyNearViewport}
@@ -336,7 +357,7 @@ function ChatMessagesPane({
 
               return (
                 <LazyMessageRow
-                  key={getMessageKey(item)}
+                  key={rowKeys[index]}
                   lazyRows={lazyRows}
                   timestamp={item.timestamp}
                   initiallyNearViewport={initiallyNearViewport}

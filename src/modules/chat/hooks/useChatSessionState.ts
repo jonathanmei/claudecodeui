@@ -5,6 +5,8 @@ import { api } from '@/shared/api';
 import type { MarkSessionIdle, SessionActivityMap,Project,ProjectSession,LLMProvider,NormalizedMessage,ChatMessage,DiffCalculator } from '@/shared/types';
 import type { SessionStore } from '@/modules/chat/hooks/useSessionStore';
 import { SESSION_MESSAGES_PAGE_SIZE } from '@/modules/chat/utils/sessionMessagePagination';
+import { ScrollAnchor, findTopVisibleRow } from '@/modules/chat/utils/scrollAnchor';
+import { sampleScrollFrames, scrollDebug } from '@/modules/chat/utils/scrollDebug';
 import { createMessageHistoryRefreshCoordinator } from '@/modules/chat/utils/messageHistoryRefreshCoordinator';
 import { createCachedDiffCalculator } from '@/modules/chat/utils/messageTransforms';
 import { normalizedToChatMessages } from '@/modules/chat/hooks/useChatMessages';
@@ -13,6 +15,8 @@ import { readSelectedProvider } from '@/shared/selectedProvider';
 import type { SearchTarget } from '@/modules/chat/utils/searchTargetLocator';
 
 const INITIAL_VISIBLE_MESSAGES = 100;
+/** How many viewport heights from the top to start fetching older history. */
+const PREFETCH_VIEWPORTS = 1.5;
 
 /** Messages kept below a search hit so it lands mid-viewport rather than at the edge. */
 const SEARCH_TARGET_CONTEXT_MESSAGES = 20;
@@ -107,28 +111,11 @@ type UseChatSessionStateArgs = {
   sessionStore: SessionStore;
 };
 
+/** Coarse restore for when the anchored row did not survive the re-render. */
 type ScrollRestoreState = {
   height: number;
   top: number;
-  anchor: HTMLElement | null;
-  anchorOffset: number | null;
 };
-
-function captureScrollRestoreState(container: HTMLDivElement): ScrollRestoreState {
-  const containerBounds = container.getBoundingClientRect();
-  const anchor = Array.from(container.querySelectorAll<HTMLElement>('.chat-message'))
-    .find((element) => element.getBoundingClientRect().bottom >= containerBounds.top)
-    ?? null;
-
-  return {
-    height: container.scrollHeight,
-    top: container.scrollTop,
-    anchor,
-    anchorOffset: anchor
-      ? anchor.getBoundingClientRect().top - containerBounds.top
-      : null,
-  };
-}
 
 /* ------------------------------------------------------------------ */
 /*  Helper: Convert a ChatMessage to a NormalizedMessage for the store */
@@ -218,6 +205,19 @@ export function useChatSessionState({
   const [showLoadAllOverlay, setShowLoadAllOverlay] = useState(false);
 
   const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const scrollAnchorRef = useRef<ScrollAnchor | null>(null);
+  /** The anchor for the current pane element, rebuilt if the element changes. */
+  const getScrollAnchor = useCallback((): ScrollAnchor | null => {
+    const container = scrollContainerRef.current;
+    if (!container) return null;
+    if (scrollAnchorRef.current?.element !== container) {
+      scrollAnchorRef.current?.disconnect();
+      scrollAnchorRef.current = new ScrollAnchor(container);
+      scrollAnchorRef.current.capture();
+    }
+    return scrollAnchorRef.current;
+  }, []);
+  useEffect(() => () => scrollAnchorRef.current?.disconnect(), []);
   const wasNearTopRef = useRef(false);
   // The sidebar-search hit this transcript still owes the user a scroll to.
   // State rather than a ref because resolving it widens the render window,
@@ -479,7 +479,7 @@ export function useChatSessionState({
 
       isLoadingMoreRef.current = true;
       setIsLoadingMoreMessages(true);
-      const scrollRestoreState = captureScrollRestoreState(container);
+      scrollDebug('load-start', { st: container.scrollTop, sh: container.scrollHeight, ch: container.clientHeight });
 
       try {
         const result = await sessionStore.fetchMore(selectedSession.id, {
@@ -490,6 +490,7 @@ export function useChatSessionState({
           ),
         });
         const { slot, prependedCount } = result;
+        scrollDebug('load-fetched', { prepended: prependedCount, more: slot.hasMore, st: container.scrollTop });
         setHasMoreMessages(slot.hasMore);
         setTotalMessages(slot.total);
         messagesOffsetRef.current = slot.offset;
@@ -510,7 +511,11 @@ export function useChatSessionState({
           return false;
         }
 
-        pendingScrollRestoreRef.current = scrollRestoreState;
+        // The scroll anchor keeps tracking the user while the request is in
+        // flight; this is only the fallback if its row does not survive. Taken
+        // now rather than before the request, and before the store's queued
+        // re-render grows the DOM.
+        pendingScrollRestoreRef.current = { height: container.scrollHeight, top: container.scrollTop };
         setVisibleMessageCount((prev) => prev + SESSION_MESSAGES_PAGE_SIZE);
         if (!slot.hasMore) {
           allMessagesLoadedRef.current = true;
@@ -535,6 +540,10 @@ export function useChatSessionState({
     const container = scrollContainerRef.current;
     if (!container) return;
 
+    // First, before anything reads layout: cancel any shift from rows that
+    // resized above the view since the last event, then re-anchor.
+    getScrollAnchor()?.correct('scroll');
+
     const nearBottom = isNearBottom();
     setIsUserScrolledUp(!nearBottom);
     scrollPositionRef.current = {
@@ -543,6 +552,10 @@ export function useChatSessionState({
     };
 
     const scrolledNearTop = container.scrollTop < 100;
+    // Fetch the next page while there is still this much transcript above the
+    // viewport, so it usually lands before the user reaches the top instead of
+    // stalling them there until the request returns.
+    const withinPrefetchDistance = container.scrollTop < container.clientHeight * PREFETCH_VIEWPORTS;
 
     // "Load all" prompt: appear (with fade-in) when the user reaches the top
     if (scrolledNearTop && hasMoreMessages && !allMessagesLoadedRef.current) {
@@ -561,7 +574,7 @@ export function useChatSessionState({
     }
 
     if (!allMessagesLoadedRef.current) {
-      if (!scrolledNearTop) { topLoadLockRef.current = false; return; }
+      if (!withinPrefetchDistance) { topLoadLockRef.current = false; return; }
       if (topLoadLockRef.current) {
         if (container.scrollTop > 20) topLoadLockRef.current = false;
         return;
@@ -569,7 +582,7 @@ export function useChatSessionState({
       const didLoad = await loadOlderMessages(container);
       if (didLoad) topLoadLockRef.current = true;
     }
-  }, [hasMoreMessages, isActive, isNearBottom, loadOlderMessages]);
+  }, [getScrollAnchor, hasMoreMessages, isActive, isNearBottom, loadOlderMessages]);
 
   const wasChatActiveRef = useRef(isActive);
   useLayoutEffect(() => {
@@ -579,16 +592,13 @@ export function useChatSessionState({
 
     const container = scrollContainerRef.current;
     if (pendingScrollRestoreRef.current) {
-      const { height, top, anchor, anchorOffset } = pendingScrollRestoreRef.current;
-      if (anchor?.isConnected && anchorOffset !== null) {
-        const nextAnchorOffset = (
-          anchor.getBoundingClientRect().top
-          - container.getBoundingClientRect().top
-        );
-        container.scrollTop += nextAnchorOffset - anchorOffset;
-      } else {
+      const { height, top } = pendingScrollRestoreRef.current;
+      const anchored = getScrollAnchor()?.correct('restore') ?? false;
+      if (!anchored) {
         container.scrollTop = top + Math.max(container.scrollHeight - height, 0);
       }
+      scrollDebug('restore', { anchored, st: container.scrollTop, sh: container.scrollHeight, shBefore: height });
+      sampleScrollFrames(container, findTopVisibleRow(container));
       pendingScrollRestoreRef.current = null;
       return;
     }
@@ -598,7 +608,9 @@ export function useChatSessionState({
         ? scrollPositionRef.current.top
         : container.scrollHeight;
     }
-  }, [chatMessages.length, isActive, isUserScrolledUp]);
+    // visibleMessageCount: the restore must run on the render that widens the
+    // window, even if the message count changed on an earlier one.
+  }, [chatMessages.length, visibleMessageCount, getScrollAnchor, isActive, isUserScrolledUp]);
 
   // Reset scroll/pagination state on session change
   useEffect(() => {
@@ -1041,7 +1053,9 @@ export function useChatSessionState({
     }
 
     const container = scrollContainerRef.current;
-    const scrollRestoreState = container ? captureScrollRestoreState(container) : null;
+    const scrollRestoreState: ScrollRestoreState | null = container
+      ? { height: container.scrollHeight, top: container.scrollTop }
+      : null;
 
     try {
       const slot = await sessionStore.fetchFromServer(requestSessionId, {
